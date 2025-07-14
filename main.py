@@ -42,7 +42,7 @@ df = pd.read_csv(CSV_PATH)
 # Cargar IDs ya usados
 if os.path.exists(USED_IDS_PATH):
     with open(USED_IDS_PATH, "r") as f:
-        usados = set(map(int, f.read().splitlines()))
+        usados = set(int(line) for line in f.read().splitlines() if line.strip())
 else:
     usados = set()
 

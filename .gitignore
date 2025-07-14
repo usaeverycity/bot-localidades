@@ -1,0 +1,4 @@
+.env
+mapa*.png
+__pycache__/
+venv/

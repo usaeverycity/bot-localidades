@@ -2,8 +2,8 @@ name: Localidades Bot
 
 on:
   schedule:
-    - cron: "*/90 * * * *"  # Corre cada 90 minutos
-  workflow_dispatch:        # También se puede lanzar manualmente desde GitHub
+    - cron: "*/90 * * * *"
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -12,6 +12,8 @@ jobs:
     steps:
       - name: 📥 Clonar el repositorio
         uses: actions/checkout@v3
+        with:
+          persist-credentials: false  # desactiva token default de GitHub
 
       - name: 🐍 Configurar Python
         uses: actions/setup-python@v4
@@ -34,3 +36,13 @@ jobs:
 
       - name: 🚀 Ejecutar el bot
         run: python main.py
+
+      - name: 🔁 Guardar cambios en usados.txt
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          git config --global user.name "everycity-bot"
+          git config --global user.email "actions@github.com"
+          git add usados.txt
+          git commit -m "🔁 Actualizo usados.txt automáticamente"
+          git push https://$GH_TOKEN@github.com/${{ github.repository }}.git HEAD:main

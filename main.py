@@ -102,7 +102,7 @@ if resp.status_code == 200:
     print(f"✅ Imagen recortada centrada y guardada como {IMAGEN_FINAL}")
 
     # 🔍 Generar imagen con zoom visual (recorte + resize)
-    zoom_factor = 1.25  # acercamiento leve
+    zoom_factor = 1.35  # acercamiento leve
     zoom_w = int(800 / zoom_factor)
     zoom_h = int(800 / zoom_factor)
     zoom_left = (800 - zoom_w) // 2

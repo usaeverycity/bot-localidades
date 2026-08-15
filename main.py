@@ -1,10 +1,12 @@
 import os
+import time
 import tweepy
 import pandas as pd
 import requests
 from io import BytesIO
 from dotenv import load_dotenv
 from PIL import Image, ImageFilter, ImageEnhance
+from requests_oauthlib import OAuth1
 
 # -------------------------
 # Load environment variables
@@ -19,7 +21,7 @@ BEARER_TOKEN = os.getenv("BEARER_TOKEN")
 MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN")
 
 # -------------------------
-# Twitter client (v2) + v1.1
+# Twitter client (v2) for posting tweets
 # -------------------------
 client = tweepy.Client(
     bearer_token=BEARER_TOKEN,
@@ -29,8 +31,87 @@ client = tweepy.Client(
     access_token_secret=ACCESS_TOKEN_SECRET
 )
 
-auth = tweepy.OAuth1UserHandler(API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET)
-api_v1 = tweepy.API(auth)
+# -------------------------
+# Media upload (X API v2) via OAuth1 directo
+# -------------------------
+# X dio de baja los endpoints de media upload v1.1 (api_v1.media_upload)
+# el 9 de junio de 2025. El reemplazo es /2/media/upload con
+# command=INIT/APPEND/FINALIZE, que todavía acepta OAuth 1.0a User Context
+# (los endpoints "nuevos" /2/media/upload/initialize|append|finalize NO
+# aceptan OAuth1, solo OAuth2 con user token — por eso no los usamos).
+MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
+
+oauth1_auth = OAuth1(
+    API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET
+)
+
+
+def upload_media_v2(filepath, media_category="tweet_image", mime_type="image/jpeg"):
+    """Sube una imagen usando el endpoint de media upload de la API v2 de X."""
+    total_bytes = os.path.getsize(filepath)
+
+    # INIT
+    init_resp = requests.post(
+        MEDIA_UPLOAD_URL,
+        data={
+            "command": "INIT",
+            "media_type": mime_type,
+            "total_bytes": total_bytes,
+            "media_category": media_category,
+        },
+        auth=oauth1_auth,
+        timeout=30,
+    )
+    if init_resp.status_code >= 300:
+        print(f"❌ INIT falló ({init_resp.status_code}): {init_resp.text}")
+        init_resp.raise_for_status()
+    media_id = init_resp.json()["data"]["id"]
+
+    # APPEND (una sola parte alcanza para imágenes; están muy por debajo de 5MB)
+    with open(filepath, "rb") as f:
+        append_resp = requests.post(
+            MEDIA_UPLOAD_URL,
+            data={"command": "APPEND", "media_id": media_id, "segment_index": 0},
+            files={"media": f},
+            auth=oauth1_auth,
+            timeout=60,
+        )
+    if append_resp.status_code >= 300:
+        print(f"❌ APPEND falló ({append_resp.status_code}): {append_resp.text}")
+        append_resp.raise_for_status()
+
+    # FINALIZE
+    finalize_resp = requests.post(
+        MEDIA_UPLOAD_URL,
+        data={"command": "FINALIZE", "media_id": media_id},
+        auth=oauth1_auth,
+        timeout=30,
+    )
+    if finalize_resp.status_code >= 300:
+        print(f"❌ FINALIZE falló ({finalize_resp.status_code}): {finalize_resp.text}")
+        finalize_resp.raise_for_status()
+    result = finalize_resp.json()["data"]
+
+    # STATUS (solo si X pide procesamiento async, común en video/gif, raro en foto)
+    processing_info = result.get("processing_info")
+    while processing_info:
+        state = processing_info["state"]
+        if state == "succeeded":
+            break
+        if state == "failed":
+            raise RuntimeError(f"Procesamiento de media falló: {processing_info}")
+        time.sleep(processing_info.get("check_after_secs", 1))
+        status_resp = requests.get(
+            MEDIA_UPLOAD_URL,
+            params={"command": "STATUS", "media_id": media_id},
+            auth=oauth1_auth,
+            timeout=30,
+        )
+        status_resp.raise_for_status()
+        result = status_resp.json()["data"]
+        processing_info = result.get("processing_info")
+
+    return media_id
 
 # -------------------------
 # Paths
@@ -151,20 +232,21 @@ with open(USED_IDS_PATH, "a") as f:
 # -------------------------
 try:
     print("📤 Uploading main image...")
-    media_main = api_v1.media_upload(filename=IMAGEN_FINAL)
+    media_main_id = upload_media_v2(IMAGEN_FINAL)
 
     print("🐦 Tweeting main image...")
     caption = f"📍 {nombre_ciudad}, {county} County, {estado}" if county.strip() else f"📍 {nombre_ciudad}, {estado}"
-    tweet_response = client.create_tweet(text=caption, media_ids=[media_main.media_id])
+    tweet_response = client.create_tweet(text=caption, media_ids=[media_main_id])
     tweet_id = tweet_response.data["id"]
     print(f"✅ Tweet ID: {tweet_id}")
 
     print("📤 Uploading zoom image...")
-    media_zoom = api_v1.media_upload(filename=IMAGEN_ZOOM)
+    media_zoom_id = upload_media_v2(IMAGEN_ZOOM)
 
     print("↩️ Replying with zoom image...")
-    reply = client.create_tweet(in_reply_to_tweet_id=tweet_id, media_ids=[media_zoom.media_id])
+    reply = client.create_tweet(in_reply_to_tweet_id=tweet_id, media_ids=[media_zoom_id])
     print(f"✅ Reply ID: {reply.data['id']}")
 
 except Exception as e:
     print("❌ Twitter error:", e)
+    raise

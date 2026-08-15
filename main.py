@@ -34,12 +34,14 @@ client = tweepy.Client(
 # -------------------------
 # Media upload (X API v2) via OAuth1 directo
 # -------------------------
-# X dio de baja los endpoints de media upload v1.1 (api_v1.media_upload)
-# el 9 de junio de 2025. El reemplazo es /2/media/upload con
-# command=INIT/APPEND/FINALIZE, que todavía acepta OAuth 1.0a User Context
-# (los endpoints "nuevos" /2/media/upload/initialize|append|finalize NO
-# aceptan OAuth1, solo OAuth2 con user token — por eso no los usamos).
-MEDIA_UPLOAD_URL = "https://api.x.com/2/media/upload"
+# Historia de este bloque:
+#   1) X dio de baja media upload v1.1 (api_v1.media_upload) el 9/6/2025.
+#   2) El reemplazo intermedio era /2/media/upload con command=INIT/APPEND/
+#      FINALIZE, pero eso TAMBIÉN fue desactivado (devuelve 400 "is not one
+#      of []" porque ya no acepta esos parámetros).
+#   3) Lo vigente son los tres endpoints dedicados de abajo, que sí aceptan
+#      OAuth 1.0a User Context (aparecen como "UserToken" en el spec).
+MEDIA_BASE_URL = "https://api.x.com/2/media/upload"
 
 oauth1_auth = OAuth1(
     API_KEY, API_KEY_SECRET, ACCESS_TOKEN, ACCESS_TOKEN_SECRET
@@ -47,14 +49,13 @@ oauth1_auth = OAuth1(
 
 
 def upload_media_v2(filepath, media_category="tweet_image", mime_type="image/jpeg"):
-    """Sube una imagen usando el endpoint de media upload de la API v2 de X."""
+    """Sube una imagen con el flujo initialize -> append -> finalize de la API v2."""
     total_bytes = os.path.getsize(filepath)
 
-    # INIT
+    # 1) INITIALIZE — body JSON (no form-data, no query params)
     init_resp = requests.post(
-        MEDIA_UPLOAD_URL,
-        data={
-            "command": "INIT",
+        f"{MEDIA_BASE_URL}/initialize",
+        json={
             "media_type": mime_type,
             "total_bytes": total_bytes,
             "media_category": media_category,
@@ -63,16 +64,18 @@ def upload_media_v2(filepath, media_category="tweet_image", mime_type="image/jpe
         timeout=30,
     )
     if init_resp.status_code >= 300:
-        print(f"❌ INIT falló ({init_resp.status_code}): {init_resp.text}")
+        print(f"❌ INITIALIZE falló ({init_resp.status_code}): {init_resp.text}")
         init_resp.raise_for_status()
     media_id = init_resp.json()["data"]["id"]
+    print(f"   media_id: {media_id}")
 
-    # APPEND (una sola parte alcanza para imágenes; están muy por debajo de 5MB)
+    # 2) APPEND — multipart/form-data. Un solo segmento alcanza:
+    #    las imágenes rondan 1.5MB y el límite por chunk es 5MB.
     with open(filepath, "rb") as f:
         append_resp = requests.post(
-            MEDIA_UPLOAD_URL,
-            data={"command": "APPEND", "media_id": media_id, "segment_index": 0},
-            files={"media": f},
+            f"{MEDIA_BASE_URL}/{media_id}/append",
+            data={"segment_index": 0},
+            files={"media": (os.path.basename(filepath), f, mime_type)},
             auth=oauth1_auth,
             timeout=60,
         )
@@ -80,36 +83,34 @@ def upload_media_v2(filepath, media_category="tweet_image", mime_type="image/jpe
         print(f"❌ APPEND falló ({append_resp.status_code}): {append_resp.text}")
         append_resp.raise_for_status()
 
-    # FINALIZE
+    # 3) FINALIZE — sin body
     finalize_resp = requests.post(
-        MEDIA_UPLOAD_URL,
-        data={"command": "FINALIZE", "media_id": media_id},
+        f"{MEDIA_BASE_URL}/{media_id}/finalize",
         auth=oauth1_auth,
         timeout=30,
     )
     if finalize_resp.status_code >= 300:
         print(f"❌ FINALIZE falló ({finalize_resp.status_code}): {finalize_resp.text}")
         finalize_resp.raise_for_status()
-    result = finalize_resp.json()["data"]
+    result = finalize_resp.json().get("data", {})
 
-    # STATUS (solo si X pide procesamiento async, común en video/gif, raro en foto)
+    # 4) STATUS — solo si X pide procesamiento async (típico en video/gif,
+    #    raro en JPEG, pero lo dejamos por las dudas)
     processing_info = result.get("processing_info")
-    while processing_info:
-        state = processing_info["state"]
-        if state == "succeeded":
-            break
-        if state == "failed":
+    while processing_info and processing_info.get("state") not in ("succeeded", None):
+        if processing_info.get("state") == "failed":
             raise RuntimeError(f"Procesamiento de media falló: {processing_info}")
         time.sleep(processing_info.get("check_after_secs", 1))
         status_resp = requests.get(
-            MEDIA_UPLOAD_URL,
+            MEDIA_BASE_URL,
             params={"command": "STATUS", "media_id": media_id},
             auth=oauth1_auth,
             timeout=30,
         )
-        status_resp.raise_for_status()
-        result = status_resp.json()["data"]
-        processing_info = result.get("processing_info")
+        if status_resp.status_code >= 300:
+            print(f"⚠️ STATUS falló ({status_resp.status_code}): {status_resp.text}")
+            break
+        processing_info = status_resp.json().get("data", {}).get("processing_info")
 
     return media_id
 
@@ -222,12 +223,6 @@ img_zoom.save(
 print(f"🔎 Zoom image saved: {IMAGEN_ZOOM} ({img_zoom.size[0]}x{img_zoom.size[1]})")
 
 # -------------------------
-# Mark ID as used only after images are generated successfully
-# -------------------------
-with open(USED_IDS_PATH, "a") as f:
-    f.write(f"{int(ciudad['id'])}\n")
-
-# -------------------------
 # Post to Twitter (main + reply with zoom)
 # -------------------------
 try:
@@ -246,6 +241,12 @@ try:
     print("↩️ Replying with zoom image...")
     reply = client.create_tweet(in_reply_to_tweet_id=tweet_id, media_ids=[media_zoom_id])
     print(f"✅ Reply ID: {reply.data['id']}")
+
+    # -------------------------
+    # Mark ID as used SOLO si se publicó de verdad (tweet + reply OK)
+    # -------------------------
+    with open(USED_IDS_PATH, "a") as f:
+        f.write(f"{int(ciudad['id'])}\n")
 
 except Exception as e:
     print("❌ Twitter error:", e)
